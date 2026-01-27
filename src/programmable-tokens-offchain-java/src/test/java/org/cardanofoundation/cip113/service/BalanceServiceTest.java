@@ -3,6 +3,7 @@ package org.cardanofoundation.cip113.service;
 import com.bloxbean.cardano.client.transaction.spec.Asset;
 import com.bloxbean.cardano.client.transaction.spec.MultiAsset;
 import com.bloxbean.cardano.client.transaction.spec.Value;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.cardanofoundation.cip113.entity.BalanceLogEntity;
 import org.cardanofoundation.cip113.repository.BalanceLogRepository;
 import org.cardanofoundation.cip113.util.BalanceValueHelper;
@@ -29,11 +30,13 @@ class BalanceServiceTest {
     private BalanceLogRepository repository;
 
     private BalanceService service;
+    private ObjectMapper objectMapper;
 
     @BeforeEach
     void setUp() {
         repository.deleteAll();
-        service = new BalanceService(repository);
+        objectMapper = new ObjectMapper();
+        service = new BalanceService(repository, objectMapper);
     }
 
     @Test

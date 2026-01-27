@@ -20,11 +20,12 @@ wallet:
 
 blockfrost:
   url: https://cardano-mainnet.blockfrost.io/api/v0/
-  key: ""
+  key: ${BLOCKFROST_KEY:}
 
 store:
   cardano:
-    host: backbone.mainnet.cardanofoundation.org
+    # host: backbone.mainnet.cardanofoundation.org
+    host: "localhost"
     port: 3001
     protocol-magic: 764824073
     # Start from the block that minted the ref input for the contract
@@ -53,6 +54,7 @@ wallet:
 
 blockfrost:
   url: https://cardano-preprod.blockfrost.io/api/v0/
+  key: ${BLOCKFROST_KEY:}
 
 store:
   cardano:
@@ -68,6 +70,9 @@ spring:
     activate:
       on-profile: preview
 
+server:
+  port: 8081
+
 network: preview
 
 wallet:
@@ -77,11 +82,13 @@ programmable.token.default.txHash: "114adc8ee212b5ded1f895ab53c7741e5521feff735d
 
 blockfrost:
   url: https://cardano-preview.blockfrost.io/api/v0/
+  key: ${BLOCKFROST_KEY:}
 
 store:
   cardano:
-    host: ""
-    port: 0
+    host: "localhost"
+    port: 3001
     protocol-magic: 2
     sync-start-blockhash: c196c1915bf07235284131d5f84b395061477285d74aba8634a82b5c2b22ed2f
     sync-start-slot: 69599150
+    keep-alive-interval: 1000

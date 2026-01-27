@@ -6,6 +6,7 @@ import com.bloxbean.cardano.client.address.Credential;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.api.util.ValueUtil;
+import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
 import com.bloxbean.cardano.client.plutus.blueprint.PlutusBlueprintUtil;
 import com.bloxbean.cardano.client.plutus.blueprint.model.PlutusVersion;
 import com.bloxbean.cardano.client.plutus.spec.*;
@@ -57,6 +58,8 @@ public class DummySubstandardHandler implements SubstandardHandler {
 
     private final UtxoRepository utxoRepository;
 
+    private final BFBackendService bfBackendService;
+
     private final RegistryNodeParser registryNodeParser;
 
     private final SubstandardService substandardService;
@@ -79,29 +82,23 @@ public class DummySubstandardHandler implements SubstandardHandler {
             var directorySpendContract = protocolScriptBuilderService.getParameterizedDirectorySpendScript(protocolBootstrapParams);
 
             var bootstrapTxHash = protocolBootstrapParams.txHash();
-
-            var protocolParamsUtxoOpt = utxoRepository.findById(UtxoId.builder()
-                    .txHash(bootstrapTxHash)
-                    .outputIndex(0)
-                    .build());
-
-            if (protocolParamsUtxoOpt.isEmpty()) {
-                return RegisterTransactionContext.error("could not resolve protocol params");
-            }
-
-            var protocolParamsUtxo = protocolParamsUtxoOpt.get();
+            
+            // Use protocol params reference from bootstrap params (reference input)
+            var protocolParamsTxInput = protocolBootstrapParams.protocolParams().txInput();
+            String protocolParamsTxHash = protocolParamsTxInput.txHash();
+            int protocolParamsOutputIndex = protocolParamsTxInput.outputIndex();
+            log.info("Using protocol params reference input from bootstrap: {}:{}", protocolParamsTxHash, protocolParamsOutputIndex);
 
             var directorySpendContractAddress = AddressProvider.getEntAddress(directorySpendContract, network.getCardanoNetwork());
             log.info("directorySpendContractAddress: {}", directorySpendContractAddress.getAddress());
 
             var directoryMintContract = protocolScriptBuilderService.getParameterizedDirectoryMintScript(protocolBootstrapParams);
-
-            var issuanceUtxoOpt = utxoRepository.findById(UtxoId.builder().txHash(bootstrapTxHash).outputIndex(2).build());
-            if (issuanceUtxoOpt.isEmpty()) {
-                return RegisterTransactionContext.error("could not resolve issuance params");
-            }
-            var issuanceUtxo = issuanceUtxoOpt.get();
-            log.info("issuanceUtxo: {}", issuanceUtxo);
+            
+            // Use issuance params reference from bootstrap params (reference input)
+            var issuanceTxInput = protocolBootstrapParams.issuanceParams().txInput();
+            String issuanceTxHash = issuanceTxInput.txHash();
+            int issuanceOutputIndex = issuanceTxInput.outputIndex();
+            log.info("Using issuance reference input from bootstrap: {}:{}", issuanceTxHash, issuanceOutputIndex);
 
             var rigistrarUtxosOpt = utxoRepository.findUnspentByOwnerAddr(registerTokenRequest.registrarAddress(), Pageable.unpaged());
             if (rigistrarUtxosOpt.isEmpty()) {
@@ -134,25 +131,59 @@ public class DummySubstandardHandler implements SubstandardHandler {
             final var progTokenPolicyId = issuanceContract.getPolicyId();
             log.info("issuanceContract: {}", progTokenPolicyId);
 
+            // Fetch registry UTXOs from Blockfrost first, then fallback to repository
+            log.info("Fetching registry UTXOs from address: {}", directorySpendContractAddress.getAddress());
+            var registryUtxosResult = bfBackendService.getUtxoService().getUtxos(directorySpendContractAddress.getAddress(), 100, 1);
+            List<Utxo> blockfrostRegistryUtxos = List.of();
+            
+            if (registryUtxosResult.isSuccessful() && registryUtxosResult.getValue() != null) {
+                blockfrostRegistryUtxos = registryUtxosResult.getValue();
+                log.info("Successfully fetched {} registry UTXOs from Blockfrost", blockfrostRegistryUtxos.size());
+            } else {
+                log.warn("Blockfrost fetch failed for registry UTXOs (successful: {}, value: {}), falling back to repository", 
+                        registryUtxosResult.isSuccessful(), registryUtxosResult.getValue() != null);
+            }
+            
+            // Also get from repository as fallback
             var registryEntries = utxoRepository.findUnspentByOwnerPaymentCredential(directorySpendContract.getPolicyId(), Pageable.unpaged());
-
-            var registryEntryOpt = registryEntries.stream()
+            var repositoryRegistryUtxos = registryEntries.stream()
                     .flatMap(Collection::stream)
-                    .filter(addressUtxoEntity -> registryNodeParser.parse(addressUtxoEntity.getInlineDatum())
-                            .map(registryNode -> registryNode.key().equals(progTokenPolicyId))
-                            .orElse(false)
-                    )
+                    .map(UtxoUtil::toUtxo)
+                    .toList();
+            
+            log.info("Found {} registry UTXOs from repository", repositoryRegistryUtxos.size());
+            
+            // Combine both sources, preferring Blockfrost
+            var allRegistryUtxos = Stream.concat(blockfrostRegistryUtxos.stream(), repositoryRegistryUtxos.stream())
+                    .distinct() // Remove duplicates based on txHash:outputIndex
+                    .toList();
+            
+            log.info("Total registry UTXOs available: {}", allRegistryUtxos.size());
+
+            // Check if token is already registered
+            var registryEntryOpt = allRegistryUtxos.stream()
+                    .filter(utxo -> {
+                        if (utxo.getInlineDatum() == null) return false;
+                        return registryNodeParser.parse(utxo.getInlineDatum())
+                                .map(registryNode -> registryNode.key().equals(progTokenPolicyId))
+                                .orElse(false);
+                    })
                     .findAny();
 
             if (registryEntryOpt.isEmpty()) {
 
-                var nodeToReplaceOpt = registryEntries.stream()
-                        .flatMap(Collection::stream)
-                        .filter(addressUtxoEntity -> {
-                            var registryDatumOpt = registryNodeParser.parse(addressUtxoEntity.getInlineDatum());
+                // Find the node to replace (where new token should be inserted)
+                var nodeToReplaceOpt = allRegistryUtxos.stream()
+                        .filter(utxo -> {
+                            if (utxo.getInlineDatum() == null) {
+                                log.warn("Registry UTXO has no inline datum: {}:{}", utxo.getTxHash(), utxo.getOutputIndex());
+                                return false;
+                            }
+                            
+                            var registryDatumOpt = registryNodeParser.parse(utxo.getInlineDatum());
 
                             if (registryDatumOpt.isEmpty()) {
-                                log.warn("could not parse registry datum for: {}", addressUtxoEntity.getInlineDatum());
+                                log.warn("could not parse registry datum for: {}", utxo.getInlineDatum());
                                 return false;
                             }
 
@@ -160,53 +191,127 @@ public class DummySubstandardHandler implements SubstandardHandler {
 
                             var after = registryDatum.key().compareTo(progTokenPolicyId) < 0;
                             var before = progTokenPolicyId.compareTo(registryDatum.next()) < 0;
-                            log.info("after:{}, before: {}", after, before);
+                            log.info("Checking registry node: key={}, next={}, after={}, before={}", 
+                                    registryDatum.key(), registryDatum.next(), after, before);
                             return after && before;
 
                         })
                         .findAny();
 
-                if (nodeToReplaceOpt.isEmpty()) {
-                    return RegisterTransactionContext.error("could not find node to replace");
+                // Check if registry is empty - need to use DirectoryInit
+                boolean isRegistryEmpty = allRegistryUtxos.isEmpty();
+                
+                RegistryNode directoryMintDatum;
+                RegistryNode directorySpendDatum;
+                Asset directoryMintNft;
+                Asset directorySpendNft;
+                ConstrPlutusData directoryMintRedeemer;
+                Utxo directoryUtxo = null;
+                
+                if (isRegistryEmpty) {
+                    // DirectoryInit: Create sentinel node only (first token registration uses DirectoryInsert with sentinel)
+                    log.info("Registry is empty - using DirectoryInit to create sentinel node");
+                    
+                    // DirectoryInit redeemer is constr(0)
+                    directoryMintRedeemer = ConstrPlutusData.of(0);
+                    
+                    // Sentinel node NFT (empty token name "0x")
+                    directoryMintNft = Asset.builder()
+                            .name("0x")
+                            .value(BigInteger.ONE)
+                            .build();
+                    
+                    // Sentinel node datum: key="", next=max_value, empty credentials
+                    directoryMintDatum = new RegistryNode("",
+                            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", // max value for next
+                            "",
+                            "",
+                            "");
+                    
+                    // For DirectoryInit, we don't have a directorySpend (no existing node to update)
+                    // We only create the sentinel node
+                    directorySpendDatum = null;
+                    directorySpendNft = null;
+                    
+                    // For DirectoryInit, we need to spend the directoryMintParams.txInput (the bootstrap UTXO)
+                    var directoryMintTxInput = protocolBootstrapParams.directoryMintParams().txInput();
+                    log.info("DirectoryInit: fetching bootstrap UTXO {}:{}", directoryMintTxInput.txHash(), directoryMintTxInput.outputIndex());
+                    var directoryMintUtxoResult = bfBackendService.getUtxoService().getTxOutput(directoryMintTxInput.txHash(), directoryMintTxInput.outputIndex());
+                    if (!directoryMintUtxoResult.isSuccessful() || directoryMintUtxoResult.getValue() == null) {
+                        // Try to get more details about why it failed
+                        String errorDetails = "Unknown error";
+                        if (directoryMintUtxoResult.getResponse() != null) {
+                            errorDetails = directoryMintUtxoResult.getResponse().toString();
+                        }
+                        log.error("Failed to fetch bootstrap UTXO for DirectoryInit: {}:{}. Error: {}. Response: {}", 
+                                directoryMintTxInput.txHash(), directoryMintTxInput.outputIndex(), 
+                                errorDetails, directoryMintUtxoResult.getResponse());
+                        
+                        // Try to get the transaction to see if it exists
+                        var txResult = bfBackendService.getTransactionService().getTransaction(directoryMintTxInput.txHash());
+                        if (txResult.isSuccessful() && txResult.getValue() != null) {
+                            log.info("Transaction {} exists, but UTXO {}:{} is not available. It may have been spent.", 
+                                    directoryMintTxInput.txHash(), directoryMintTxInput.txHash(), directoryMintTxInput.outputIndex());
+                            return RegisterTransactionContext.error("Bootstrap UTXO " + directoryMintTxInput.txHash() + ":" + 
+                                    directoryMintTxInput.outputIndex() + " has been spent. DirectoryInit can only be performed once. " +
+                                    "If the registry is empty, the sentinel node may need to be created manually or the bootstrap UTXO reference may be incorrect.");
+                        } else {
+                            return RegisterTransactionContext.error("Could not fetch bootstrap UTXO for DirectoryInit: " + 
+                                    directoryMintTxInput.txHash() + ":" + directoryMintTxInput.outputIndex() + 
+                                    ". Transaction may not exist or Blockfrost may not have indexed it yet. Error: " + errorDetails +
+                                    ". Please verify the bootstrap transaction hash and output index in protocol bootstrap parameters.");
+                        }
+                    }
+                    directoryUtxo = directoryMintUtxoResult.getValue();
+                    log.info("DirectoryInit: fetched bootstrap UTXO successfully: {}:{}", directoryUtxo.getTxHash(), directoryUtxo.getOutputIndex());
+                    
+                } else {
+                    // DirectoryInsert: Insert into existing registry
+                    if (nodeToReplaceOpt.isEmpty()) {
+                        log.error("Could not find node to replace. Total registry UTXOs: {}", allRegistryUtxos.size());
+                        return RegisterTransactionContext.error("could not find node to replace");
+                    }
+
+                    directoryUtxo = nodeToReplaceOpt.get();
+                    log.info("directoryUtxo: {}:{}", directoryUtxo.getTxHash(), directoryUtxo.getOutputIndex());
+                    var existingRegistryNodeDatumOpt = registryNodeParser.parse(directoryUtxo.getInlineDatum());
+
+                    if (existingRegistryNodeDatumOpt.isEmpty()) {
+                        return RegisterTransactionContext.error("could not parse current registry node");
+                    }
+
+                    var existingRegistryNodeDatum = existingRegistryNodeDatumOpt.get();
+
+                    // Directory MINT - NFT, address, datum and value
+                    directoryMintRedeemer = ConstrPlutusData.of(1,
+                            BytesPlutusData.of(issuanceContract.getScriptHash()),
+                            BytesPlutusData.of(substandardIssueContract.getScriptHash())
+                    );
+
+                    directoryMintNft = Asset.builder()
+                            .name("0x" + issuanceContract.getPolicyId())
+                            .value(BigInteger.ONE)
+                            .build();
+
+                    directorySpendNft = Asset.builder()
+                            .name("0x")
+                            .value(BigInteger.ONE)
+                            .build();
+
+                    directorySpendDatum = existingRegistryNodeDatum.toBuilder()
+                            .next(HexUtil.encodeHexString(issuanceContract.getScriptHash()))
+                            .build();
+                    log.info("directorySpendDatum: {}", directorySpendDatum);
+
+                    directoryMintDatum = new RegistryNode(HexUtil.encodeHexString(issuanceContract.getScriptHash()),
+                            existingRegistryNodeDatum.next(),
+                            HexUtil.encodeHexString(substandardTransferContract.getScriptHash()),
+                            thirdPartyScriptHash,
+                            "");
+                    log.info("directoryMintDatum: {}", directoryMintDatum);
+                    
+                    directoryUtxo = directoryUtxo;
                 }
-
-                var directoryUtxo = UtxoUtil.toUtxo(nodeToReplaceOpt.get());
-                log.info("directoryUtxo: {}", directoryUtxo);
-                var existingRegistryNodeDatumOpt = registryNodeParser.parse(directoryUtxo.getInlineDatum());
-
-                if (existingRegistryNodeDatumOpt.isEmpty()) {
-                    return RegisterTransactionContext.error("could not parse current registry node");
-                }
-
-                var existingRegistryNodeDatum = existingRegistryNodeDatumOpt.get();
-
-                // Directory MINT - NFT, address, datum and value
-                var directoryMintRedeemer = ConstrPlutusData.of(1,
-                        BytesPlutusData.of(issuanceContract.getScriptHash()),
-                        BytesPlutusData.of(substandardIssueContract.getScriptHash())
-                );
-
-                var directoryMintNft = Asset.builder()
-                        .name("0x" + issuanceContract.getPolicyId())
-                        .value(BigInteger.ONE)
-                        .build();
-
-                var directorySpendNft = Asset.builder()
-                        .name("0x")
-                        .value(BigInteger.ONE)
-                        .build();
-
-                var directorySpendDatum = existingRegistryNodeDatum.toBuilder()
-                        .next(HexUtil.encodeHexString(issuanceContract.getScriptHash()))
-                        .build();
-                log.info("directorySpendDatum: {}", directorySpendDatum);
-
-                var directoryMintDatum = new RegistryNode(HexUtil.encodeHexString(issuanceContract.getScriptHash()),
-                        existingRegistryNodeDatum.next(),
-                        HexUtil.encodeHexString(substandardTransferContract.getScriptHash()),
-                        thirdPartyScriptHash,
-                        "");
-                log.info("directoryMintDatum: {}", directoryMintDatum);
 
                 Value directoryMintValue = Value.builder()
                         .coin(Amount.ada(1).getQuantity())
@@ -219,16 +324,20 @@ public class DummySubstandardHandler implements SubstandardHandler {
                         .build();
                 log.info("directoryMintValue: {}", directoryMintValue);
 
-                Value directorySpendValue = Value.builder()
-                        .coin(Amount.ada(1).getQuantity())
-                        .multiAssets(List.of(
-                                MultiAsset.builder()
-                                        .policyId(directoryMintContract.getPolicyId())
-                                        .assets(List.of(directorySpendNft))
-                                        .build()
-                        ))
-                        .build();
-                log.info("directorySpendValue: {}", directorySpendValue);
+                // DirectorySpendValue is only needed for DirectoryInsert (when updating existing node)
+                Value directorySpendValue = null;
+                if (!isRegistryEmpty && directorySpendNft != null) {
+                    directorySpendValue = Value.builder()
+                            .coin(Amount.ada(1).getQuantity())
+                            .multiAssets(List.of(
+                                    MultiAsset.builder()
+                                            .policyId(directoryMintContract.getPolicyId())
+                                            .assets(List.of(directorySpendNft))
+                                            .build()
+                            ))
+                            .build();
+                    log.info("directorySpendValue: {}", directorySpendValue);
+                }
 
 
                 var issuanceRedeemer = ConstrPlutusData.of(0, ConstrPlutusData.of(1, BytesPlutusData.of(substandardIssueContract.getScriptHash())));
@@ -260,25 +369,44 @@ public class DummySubstandardHandler implements SubstandardHandler {
 
 
                 var tx = new ScriptTx()
-                        .collectFrom(registrarUtxos)
-                        .collectFrom(directoryUtxo, ConstrPlutusData.of(0))
-                        .withdraw(substandardIssueAddress.getAddress(), BigInteger.ZERO, BigIntPlutusData.of(100))
+                        .collectFrom(registrarUtxos);
+                
+                // For DirectoryInit, we spend the bootstrap UTXO; for DirectoryInsert, we collect the directory UTXO
+                if (isRegistryEmpty) {
+                    // DirectoryInit: spend the bootstrap UTXO (directoryMintParams.txInput)
+                    tx.collectFrom(directoryUtxo, ConstrPlutusData.of(0));
+                    log.info("DirectoryInit: collecting bootstrap UTXO {}:{}", directoryUtxo.getTxHash(), directoryUtxo.getOutputIndex());
+                } else {
+                    // DirectoryInsert: collect the existing directory UTXO
+                    tx.collectFrom(directoryUtxo, ConstrPlutusData.of(0));
+                    log.info("DirectoryInsert: collecting directory UTXO {}:{}", directoryUtxo.getTxHash(), directoryUtxo.getOutputIndex());
+                }
+                
+                tx.withdraw(substandardIssueAddress.getAddress(), BigInteger.ZERO, BigIntPlutusData.of(100))
                         // Mint Token
                         .mintAsset(issuanceContract, programmableToken, issuanceRedeemer)
-                        // Redeemer is DirectoryInit (constr(0))
+                        // Directory mint redeemer: DirectoryInit (constr(0)) or DirectoryInsert (constr(1))
                         .mintAsset(directoryMintContract, directoryMintNft, directoryMintRedeemer)
-                        .payToContract(targetAddress.getAddress(), ValueUtil.toAmountList(programmableTokenValue), ConstrPlutusData.of(0))
-                        // Directory Params
-                        .payToContract(directorySpendContractAddress.getAddress(), ValueUtil.toAmountList(directorySpendValue), directorySpendDatum.toPlutusData())
-                        // Directory Params
-                        .payToContract(directorySpendContractAddress.getAddress(), ValueUtil.toAmountList(directoryMintValue), directoryMintDatum.toPlutusData())
-                        .readFrom(TransactionInput.builder()
-                                        .transactionId(protocolParamsUtxo.getTxHash())
-                                        .index(protocolParamsUtxo.getOutputIndex())
+                        .payToContract(targetAddress.getAddress(), ValueUtil.toAmountList(programmableTokenValue), ConstrPlutusData.of(0));
+                
+                // For DirectoryInit, we only create the sentinel node (no directorySpend)
+                // For DirectoryInsert, we update existing node and create new node
+                if (isRegistryEmpty) {
+                    // DirectoryInit: create sentinel node only (no existing node to update)
+                    tx.payToContract(directorySpendContractAddress.getAddress(), ValueUtil.toAmountList(directoryMintValue), directoryMintDatum.toPlutusData());
+                } else {
+                    // DirectoryInsert: update existing node (spend) and create new node (mint)
+                    tx.payToContract(directorySpendContractAddress.getAddress(), ValueUtil.toAmountList(directorySpendValue), directorySpendDatum.toPlutusData())
+                      .payToContract(directorySpendContractAddress.getAddress(), ValueUtil.toAmountList(directoryMintValue), directoryMintDatum.toPlutusData());
+                }
+                
+                tx.readFrom(TransactionInput.builder()
+                                        .transactionId(protocolParamsTxHash)
+                                        .index(protocolParamsOutputIndex)
                                         .build(),
                                 TransactionInput.builder()
-                                        .transactionId(issuanceUtxo.getTxHash())
-                                        .index(issuanceUtxo.getOutputIndex())
+                                        .transactionId(issuanceTxHash)
+                                        .index(issuanceOutputIndex)
                                         .build())
                         .attachSpendingValidator(directorySpendContract)
                         .attachRewardValidator(substandardIssueContract)
@@ -457,17 +585,29 @@ public class DummySubstandardHandler implements SubstandardHandler {
 
             var progTokenRegistry = progTokenRegistryOpt.get();
 
+            // Try Blockfrost first, fallback to repository
+            var protocolParamsUtxoResult = bfBackendService.getUtxoService().getTxOutput(bootstrapTxHash, 0);
+            String protocolParamsTxHash;
+            int protocolParamsOutputIndex;
+            
+            if (protocolParamsUtxoResult.isSuccessful() && protocolParamsUtxoResult.getValue() != null) {
+                var bfUtxo = protocolParamsUtxoResult.getValue();
+                protocolParamsTxHash = bfUtxo.getTxHash();
+                protocolParamsOutputIndex = bfUtxo.getOutputIndex();
+            } else {
+                // Fallback to repository
             var protocolParamsUtxoOpt = utxoRepository.findById(UtxoId.builder()
                     .txHash(bootstrapTxHash)
                     .outputIndex(0)
                     .build());
-
             if (protocolParamsUtxoOpt.isEmpty()) {
                 return TransactionContext.error("could not resolve protocol params");
             }
-
             var protocolParamsUtxo = protocolParamsUtxoOpt.get();
-            log.info("protocolParamsUtxo: {}", protocolParamsUtxo);
+                protocolParamsTxHash = protocolParamsUtxo.getTxHash();
+                protocolParamsOutputIndex = protocolParamsUtxo.getOutputIndex();
+            }
+            log.info("protocolParamsUtxo: {}:{}", protocolParamsTxHash, protocolParamsOutputIndex);
 
             var senderAddress = new Address(transferTokenRequest.senderAddress());
             var senderProgrammableTokenAddress = AddressProvider.getBaseAddress(Credential.fromScript(protocolBootstrapParams.programmableLogicBaseParams().scriptHash()),
@@ -580,8 +720,8 @@ public class DummySubstandardHandler implements SubstandardHandler {
                     .payToContract(senderProgrammableTokenAddress.getAddress(), ValueUtil.toAmountList(returningValue), ConstrPlutusData.of(0))
                     .payToContract(recipientProgrammableTokenAddress.getAddress(), ValueUtil.toAmountList(tokenValue2), ConstrPlutusData.of(0))
                     .readFrom(TransactionInput.builder()
-                            .transactionId(protocolParamsUtxo.getTxHash())
-                            .index(protocolParamsUtxo.getOutputIndex())
+                            .transactionId(protocolParamsTxHash)
+                            .index(protocolParamsOutputIndex)
                             .build(), TransactionInput.builder()
                             .transactionId(progTokenRegistry.getTxHash())
                             .index(progTokenRegistry.getOutputIndex())

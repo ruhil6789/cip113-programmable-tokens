@@ -51,8 +51,18 @@ public class ProtocolBootstrapService {
             log.info("protocolBootstrapFilename: {}", protocolBootstrapFilename);
 
             // Load array of protocol bootstrap configurations
+            var resourceStream = this.getClass().getClassLoader().getResourceAsStream(protocolBootstrapFilename);
+            if (resourceStream == null) {
+                // Try alternative classloader
+                resourceStream = ProtocolBootstrapService.class.getResourceAsStream("/" + protocolBootstrapFilename);
+            }
+            if (resourceStream == null) {
+                throw new IOException("Could not find resource: " + protocolBootstrapFilename + 
+                    " (tried classloader and class resource paths)");
+            }
+            
             var bootstrapsList = objectMapper.readValue(
-                    this.getClass().getClassLoader().getResourceAsStream(protocolBootstrapFilename),
+                    resourceStream,
                     new TypeReference<List<ProtocolBootstrapParams>>() {}
             );
 
@@ -78,8 +88,15 @@ public class ProtocolBootstrapService {
             }
 
             // Load plutus contracts
+            var plutusStream = this.getClass().getClassLoader().getResourceAsStream("plutus.json");
+            if (plutusStream == null) {
+                plutusStream = ProtocolBootstrapService.class.getResourceAsStream("/plutus.json");
+            }
+            if (plutusStream == null) {
+                throw new IOException("Could not find resource: plutus.json");
+            }
             plutus = objectMapper.readValue(
-                    this.getClass().getClassLoader().getResourceAsStream("plutus.json"),
+                    plutusStream,
                     Plutus.class
             );
 

@@ -27,6 +27,7 @@ export function RegistrationForm({
   onTransactionBuilt,
 }: RegistrationFormProps) {
   const { connected, wallet } = useWallet();
+  console.log(connected,"connected");
   const { toast: showToast } = useToast();
 
   const [tokenName, setTokenName] = useState('');
@@ -117,11 +118,29 @@ export function RegistrationForm({
       setIsBuilding(true);
 
       // Get registrar address from wallet
-      const addresses = await wallet.getUsedAddresses();
-      if (!addresses || addresses.length === 0) {
-        throw new Error('No addresses found in wallet');
+      // const addresses = await wallet.getUsedAddresses();
+      // console.log(addresses,"addresses")
+      // if (!addresses || addresses.length === 0) {
+      //   throw new Error('No addresses found in wallet');
+      // }
+      // const registrarAddress = addresses[0];
+      let registrarAddress: string;
+  
+      // Try used addresses first
+      const usedAddresses = await wallet.getUsedAddresses();
+      console.log(usedAddresses,"usedAddresses")
+      if (usedAddresses && usedAddresses.length > 0) {
+        registrarAddress = usedAddresses[0];
+      } else {
+        // Fallback to unused addresses for new wallets
+        const unusedAddresses = await wallet.getUnusedAddresses();
+        if (unusedAddresses && unusedAddresses.length > 0) {
+          registrarAddress = unusedAddresses[0];
+        } else {
+          // Final fallback to change address
+          registrarAddress = await wallet.getChangeAddress();
+        }
       }
-      const registrarAddress = addresses[0];
 
       // Prepare registration request
       const request: RegisterTokenRequest = {
