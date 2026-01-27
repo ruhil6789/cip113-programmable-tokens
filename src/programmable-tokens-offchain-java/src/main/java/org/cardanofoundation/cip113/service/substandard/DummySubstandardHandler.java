@@ -43,6 +43,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Stream;
 
+import static java.math.BigInteger.ONE;
+
 /**
  * Handler for the "dummy" programmable token substandard.
  * This is a simple reference implementation with basic issue and transfer validators.
@@ -93,12 +95,14 @@ public class DummySubstandardHandler implements SubstandardHandler {
             log.info("directorySpendContractAddress: {}", directorySpendContractAddress.getAddress());
 
             var directoryMintContract = protocolScriptBuilderService.getParameterizedDirectoryMintScript(protocolBootstrapParams);
-            
-            // Use issuance params reference from bootstrap params (reference input)
-            var issuanceTxInput = protocolBootstrapParams.issuanceParams().txInput();
-            String issuanceTxHash = issuanceTxInput.txHash();
-            int issuanceOutputIndex = issuanceTxInput.outputIndex();
-            log.info("Using issuance reference input from bootstrap: {}:{}", issuanceTxHash, issuanceOutputIndex);
+            var directoryMintPolicyId = directoryMintContract.getPolicyId();
+
+            var issuanceUtxoOpt = utxoRepository.findById(UtxoId.builder().txHash(bootstrapTxHash).outputIndex(2).build());
+            if (issuanceUtxoOpt.isEmpty()) {
+                return RegisterTransactionContext.error("could not resolve issuance params");
+            }
+            var issuanceUtxo = issuanceUtxoOpt.get();
+            log.info("issuanceUtxo: {}", issuanceUtxo);
 
             var rigistrarUtxosOpt = utxoRepository.findUnspentByOwnerAddr(registerTokenRequest.registrarAddress(), Pageable.unpaged());
             if (rigistrarUtxosOpt.isEmpty()) {
@@ -313,6 +317,50 @@ public class DummySubstandardHandler implements SubstandardHandler {
                     directoryUtxo = directoryUtxo;
                 }
 
+<<<<<<< HEAD
+=======
+                var existingRegistryNodeDatum = existingRegistryNodeDatumOpt.get();
+
+                // Directory MINT - NFT, address, datum and value
+                var directoryMintRedeemer = ConstrPlutusData.of(1,
+                        BytesPlutusData.of(issuanceContract.getScriptHash()),
+                        BytesPlutusData.of(substandardIssueContract.getScriptHash())
+                );
+
+                var directoryMintNft = Asset.builder()
+                        .name("0x" + issuanceContract.getPolicyId())
+                        .value(BigInteger.ONE)
+                        .build();
+
+                Optional<Amount> registrySpentNftOpt = directoryUtxo.getAmount()
+                        .stream()
+                        .filter(amount -> amount.getQuantity().equals(ONE) && directoryMintPolicyId.equals(AssetType.fromUnit(amount.getUnit()).policyId()))
+                        .findAny();
+
+                if (registrySpentNftOpt.isEmpty()) {
+                    return RegisterTransactionContext.error("could not find amount for directory mint");
+                }
+
+                var registrySpentNft = AssetType.fromUnit(registrySpentNftOpt.get().getUnit());
+
+                var directorySpendNft = Asset.builder()
+                        .name("0x" + registrySpentNft.assetName())
+                        .value(ONE)
+                        .build();
+
+                var directorySpendDatum = existingRegistryNodeDatum.toBuilder()
+                        .next(HexUtil.encodeHexString(issuanceContract.getScriptHash()))
+                        .build();
+                log.info("directorySpendDatum: {}", directorySpendDatum);
+
+                var directoryMintDatum = new RegistryNode(HexUtil.encodeHexString(issuanceContract.getScriptHash()),
+                        existingRegistryNodeDatum.next(),
+                        HexUtil.encodeHexString(substandardTransferContract.getScriptHash()),
+                        thirdPartyScriptHash,
+                        "");
+                log.info("directoryMintDatum: {}", directoryMintDatum);
+
+>>>>>>> main
                 Value directoryMintValue = Value.builder()
                         .coin(Amount.ada(1).getQuantity())
                         .multiAssets(List.of(

@@ -26,6 +26,8 @@ import static org.junit.jupiter.api.Assertions.*;
 })
 class BalanceServiceTest {
 
+    private final ObjectMapper mapper = new ObjectMapper();
+
     @Autowired
     private BalanceLogRepository repository;
 
@@ -35,8 +37,7 @@ class BalanceServiceTest {
     @BeforeEach
     void setUp() {
         repository.deleteAll();
-        objectMapper = new ObjectMapper();
-        service = new BalanceService(repository, objectMapper);
+        service = new BalanceService(repository, mapper);
     }
 
     @Test
